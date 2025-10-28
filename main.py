@@ -1,146 +1,703 @@
 import io
 import os
+import json
 import zipfile
-from types import SimpleNamespace
-
+import pandas as pd
 import streamlit as st
+from types import SimpleNamespace
 
 # Importações das nossas classes
 from models.document_model import Documento
-from utils.ocr_processor import OcrProcessor
 from utils.database_handler import DatabaseHandler
-from utils.llm_extractor import LlmExtractor
 
-# --- Configuração da Página e Cache ---
-
+# --- Configuração da Página ---
 st.set_page_config(
     page_title="Sistema de Processamento de Documentos",
     page_icon="📄",
     layout="wide"
 )
 
-# Cache do processador OCR para evitar recarregá-lo a cada interação
-@st.cache_resource
-def load_ocr_processor():
-    """Carrega a instância do OcrProcessor."""
-    return OcrProcessor()
-
+# --- Cache Resources ---
 @st.cache_resource
 def load_db_handler():
     """Garante que o diretório de dados exista e carrega o DatabaseHandler."""
     db_dir = "data"
-    # Garante que o diretório para o BD exista
     os.makedirs(db_dir, exist_ok=True)
     return DatabaseHandler(db_path=os.path.join(db_dir, "documentos.db"))
 
-@st.cache_resource
-def load_llm_extractor(api_key):
-    """Carrega a instância do LlmExtractor se a chave da API for fornecida."""
-    if api_key:
-        return LlmExtractor(api_key=api_key)
-    return None
+# --- Funções Auxiliares ---
+
+def read_dataframe(uploaded_file):
+    """Lê arquivo CSV ou XLSX e retorna um DataFrame com detecção robusta de encoding."""
+    try:
+        if uploaded_file.name.endswith('.csv'):
+            # Lista de encodings comuns no Brasil
+            encodings = ['utf-8', 'latin1', 'iso-8859-1', 'cp1252', 'windows-1252']
+            
+            df = None
+            encoding_usado = None
+            
+            for encoding in encodings:
+                try:
+                    uploaded_file.seek(0)
+                    df = pd.read_csv(
+                        uploaded_file, 
+                        encoding=encoding,
+                        on_bad_lines='skip',
+                        engine='python',
+                        sep=None  # Detecta delimitador automaticamente
+                    )
+                    encoding_usado = encoding
+                    break  # Se funcionou, para o loop
+                except (UnicodeDecodeError, Exception):
+                    continue
+            
+            if df is None:
+                # Última tentativa: forçar latin1 (nunca falha mas pode gerar caracteres estranhos)
+                uploaded_file.seek(0)
+                df = pd.read_csv(
+                    uploaded_file,
+                    encoding='latin1',
+                    on_bad_lines='skip',
+                    engine='python'
+                )
+                encoding_usado = 'latin1 (forçado)'
+            
+            st.info(f"📝 Arquivo lido com encoding: **{encoding_usado}**")
+            
+        else:  # xlsx
+            df = pd.read_excel(uploaded_file)
+        
+        # Limpeza de dados
+        df = df.dropna(axis=1, how='all')  # Remove colunas vazias
+        df = df.dropna(axis=0, how='all')  # Remove linhas vazias
+        
+        # Limpar espaços em branco dos nomes das colunas
+        df.columns = df.columns.str.strip()
+        
+        return df
+        
+    except Exception as e:
+        st.error(f"❌ Erro ao ler arquivo: {e}")
+        st.info("💡 **Dicas:**\n- Verifique se o arquivo não está corrompido\n- Tente abrir no Excel e salvar novamente como CSV UTF-8")
+        return None
+
+def buscar_nf_externa(chave_acesso, api_key=None):
+    """
+    Busca informações da NF em plataforma externa usando a chave de acesso.
+    
+    Args:
+        chave_acesso: Chave de acesso da NF-e (44 dígitos)
+        api_key: Chave da API para autenticação (se necessário)
+    
+    Returns:
+        dict: Dados da NF ou None se falhar
+    """
+    # TODO: Implementar integração com API externa
+    # Exemplos de APIs: SEFAZ, Receita Federal, ou serviços terceiros
+    
+    st.warning("⚠️ Função de busca externa ainda não implementada")
+    
+    # Exemplo de estrutura de retorno:
+    return {
+        'chave_acesso': chave_acesso,
+        'numero_nf': 'EXEMPLO',
+        'emitente_cnpj': '00.000.000/0000-00',
+        'emitente_nome': 'Empresa Exemplo',
+        'valor_total': 1000.00,
+        'data_emissao': '2025-01-15',
+        'status': 'Autorizada'
+    }
+
+def processar_csv_para_db(df, db_handler):
+    """Salva dados do CSV diretamente no banco."""
+    sucesso = 0
+    erros = 0
+    
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    for idx, row in df.iterrows():
+        try:
+            # Adapte os campos conforme sua estrutura
+            doc = Documento(
+                nome_arquivo=row.get('nome_arquivo', f'documento_{idx}'),
+                tipo_documento=row.get('tipo_documento', 'Nota Fiscal'),
+                conteudo_extraido=row.get('conteudo_extraido', ''),
+                # Adicione outros campos conforme necessário
+            )
+            
+            # Adicionar campos extras se existirem
+            if 'chave_acesso' in row:
+                doc.chave_acesso = row['chave_acesso']
+            if 'valor_total' in row:
+                doc.valor_total = row['valor_total']
+            
+            db_handler.save_document(doc)
+            sucesso += 1
+        except Exception as e:
+            erros += 1
+            st.warning(f"Erro ao salvar linha {idx}: {e}")
+        
+        progress_bar.progress((idx + 1) / len(df))
+        status_text.text(f"Processando: {idx + 1}/{len(df)}")
+    
+    progress_bar.empty()
+    status_text.empty()
+    
+    return sucesso, erros
+
+def processar_csv_com_busca_externa(df, db_handler, api_key=None):
+    """Busca informações externas e salva no banco."""
+    if 'chave_acesso' not in df.columns:
+        st.error("❌ A coluna 'chave_acesso' não foi encontrada no arquivo!")
+        return 0, 0
+    
+    sucesso = 0
+    erros = 0
+    
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    for idx, row in df.iterrows():
+        try:
+            chave = row['chave_acesso']
+            status_text.text(f"Buscando informações para chave: {chave[:10]}...")
+            
+            # Buscar dados externos
+            dados_externos = buscar_nf_externa(chave, api_key)
+            
+            if dados_externos:
+                # Criar documento com dados enriquecidos
+                doc = Documento(
+                    nome_arquivo=f"NF_{dados_externos.get('numero_nf', idx)}",
+                    tipo_documento='Nota Fiscal Eletrônica',
+                    conteudo_extraido=str(dados_externos)
+                )
+                
+                # Adicionar campos específicos
+                for key, value in dados_externos.items():
+                    setattr(doc, key, value)
+                
+                db_handler.save_document(doc)
+                sucesso += 1
+            else:
+                erros += 1
+                
+        except Exception as e:
+            erros += 1
+            st.warning(f"Erro ao processar chave {row.get('chave_acesso', 'N/A')}: {e}")
+        
+        progress_bar.progress((idx + 1) / len(df))
+    
+    progress_bar.empty()
+    status_text.empty()
+    
+    return sucesso, erros
 
 # --- Interface Principal ---
+st.title("📄 Sistema de Processamento de Documentos")
 
-st.title("Sistema de Processamento de Documentos")
+# --- Painel de Estatísticas do Banco ---
+try:
+    import sqlite3
+    conn = sqlite3.connect("data/documentos.db")
+    cursor = conn.cursor()
+    
+    # Contar documentos
+    cursor.execute("SELECT COUNT(*) FROM documentos")
+    total_docs = cursor.fetchone()[0]
+    
+    # Contar por tipo
+    cursor.execute("SELECT tipo_documento, COUNT(*) FROM documentos GROUP BY tipo_documento")
+    tipos = cursor.fetchall()
+    
+    conn.close()
+    
+    if total_docs > 0:
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("📦 Total de Documentos", total_docs)
+        with col2:
+            if tipos:
+                tipo_principal = tipos[0][0] if tipos[0][0] else "N/A"
+                st.metric("📋 Tipo Principal", tipo_principal)
+        with col3:
+            st.metric("🗂️ Tipos Diferentes", len(tipos))
+        
+        with st.expander("📊 Ver detalhes por tipo"):
+            for tipo, count in tipos:
+                st.write(f"- **{tipo or 'Sem tipo'}**: {count} documento(s)")
+        
+        st.write("---")
+except Exception as e:
+    pass  # Ignora se o banco ainda não existe
 
-# --- Barra Lateral para Configuração ---
-st.sidebar.header("Configurações")
+# --- Barra Lateral ---
+st.sidebar.header("⚙️ Configurações")
 openai_api_key = st.sidebar.text_input(
     "Chave da API OpenAI",
     type="password",
     help="Necessária para extrair informações detalhadas dos documentos."
 )
 
-st.write("Faça o upload de um ou mais documentos (PDF, XML, DOCX, Imagem) ou um arquivo ZIP.")
-
-# Carrega os handlers
-try:
-    ocr_processor = load_ocr_processor()
-    db_handler = load_db_handler()
-    llm_extractor = load_llm_extractor(openai_api_key)
-except Exception as e:
-    st.error(f"Falha ao inicializar os serviços. Verifique as dependências. Erro: {e}")
-    st.stop()  # Interrompe a execução se o OCR não puder ser carregado
-
-# Componente de upload de arquivo
-uploaded_file = st.file_uploader(
-    "Escolha um arquivo",
-    type=['pdf', 'xml', 'docx', 'png', 'jpg', 'jpeg', 'zip']
+api_externa_key = st.sidebar.text_input(
+    "Chave da API Externa (SEFAZ/Outro)",
+    type="password",
+    help="Para buscar informações de NF-e em plataformas externas."
 )
 
-# --- Lógica de Processamento ---
+# Carregar Database Handler
+try:
+    db_handler = load_db_handler()
+except Exception as e:
+    st.error(f"Falha ao inicializar o banco de dados: {e}")
+    st.stop()
 
-if uploaded_file is not None:
-    st.success(f"Arquivo '{uploaded_file.name}' carregado com sucesso!")
+# --- Tabs para diferentes modos ---
+tab1, tab2 = st.tabs(["📤 Upload de Arquivos", "💬 Chat com IA"])
 
-    # Função auxiliar para processar um único arquivo e exibir os resultados
-    def process_and_display(file_obj):
-        with st.spinner(f"Processando '{file_obj.name}'..."):
-            try:
-                # 1. Extrair texto com o OCR Processor
-                extracted_text = ocr_processor.process_file(file_obj)
-
-                # 2. Usar LLM para extrair detalhes (se a chave da API foi fornecida)
-                if llm_extractor:
-                    st.info("Analisando conteúdo com IA para extrair detalhes...")
-                    extracted_details = llm_extractor.extract_details(extracted_text)
-                    doc_type = extracted_details.pop('tipo_documento', 'Não Identificado')
-                    # Os detalhes restantes serão os atributos específicos
-                    doc = Documento(
-                        nome_arquivo=file_obj.name,
-                        tipo_documento=doc_type,
-                        **extracted_details
-                    )
-                else:
-                    # Cria a instância sem os detalhes do LLM
-                    doc = Documento(nome_arquivo=file_obj.name)
-
-                doc.conteudo_extraido = extracted_text
-
-                # 3. Salvar no banco de dados
-                db_handler.save_document(doc)
-
-                # 4. Exibir resultados
+with tab1:
+    st.write("Faça upload de documentos (PDF, XML, DOCX, Imagem, ZIP) ou planilhas (CSV, XLSX).")
+    
+    uploaded_file = st.file_uploader(
+        "Escolha um arquivo",
+        type=['pdf', 'xml', 'docx', 'png', 'jpg', 'jpeg', 'zip', 'csv', 'xlsx']
+    )
+    
+    if uploaded_file is not None:
+        st.success(f"✅ Arquivo '{uploaded_file.name}' carregado!")
+        
+        # Detectar tipo de arquivo
+        is_csv_xlsx = uploaded_file.name.endswith(('.csv', '.xlsx'))
+        is_zip = uploaded_file.name.endswith('.zip')
+        is_xml = uploaded_file.name.endswith('.xml')
+        
+        # --- PROCESSAMENTO CSV/XLSX ---
+        if is_csv_xlsx:
+            st.subheader("📊 Processamento de Planilha")
+            
+            df = read_dataframe(uploaded_file)
+            
+            if df is not None:
+                st.write("**Preview dos Dados:**")
+                st.dataframe(df.head(10), use_container_width=True)
+                
+                st.write(f"**Total de registros:** {len(df)}")
+                st.write(f"**Colunas:** {', '.join(df.columns.tolist())}")
+                
+                # Opções de processamento
                 st.write("---")
-                st.success(f"Documento '{doc.nome_arquivo}' salvo no banco de dados!")
-                st.subheader(f"Resultados para: {doc.nome_arquivo}")
-                st.write(f"**Objeto Documento Criado:**")
-                st.json(doc.to_dict())
-
-                with st.expander("Ver Conteúdo Extraído"):
-                    st.text(doc.conteudo_extraido)
-
-            except NotImplementedError as e:
-                st.warning(f"Aviso para '{file_obj.name}': {e}")
-            except Exception as e:
-                st.error(f"Falha ao processar '{file_obj.name}': {e}")
-
-    if not openai_api_key:
-        st.warning("A chave da API da OpenAI não foi fornecida. A extração detalhada de informações (como tipo de documento, CNPJ, etc.) será desativada.")
-
-    # Lógica para lidar com ZIP ou arquivos únicos
-    is_zip = uploaded_file.type == "application/zip" or uploaded_file.name.endswith('.zip')
-
-    if st.button(f"Processar {'Arquivo ZIP' if is_zip else 'Documento'}"):
-        if is_zip:
-            try:
-                zip_buffer = io.BytesIO(uploaded_file.getvalue())
-                with zipfile.ZipFile(zip_buffer, 'r') as zip_ref:
-                    for file_name in zip_ref.namelist():
-                        # Ignorar diretórios e arquivos ocultos do macOS
-                        if file_name.endswith('/') or file_name.startswith('__MACOSX'):
-                            continue
+                st.subheader("🔧 Escolha como processar:")
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    if st.button("💾 Salvar Dados Diretos no BD", use_container_width=True):
+                        with st.spinner("Salvando dados no banco..."):
+                            sucesso, erros = processar_csv_para_db(df, db_handler)
                         
-                        with zip_ref.open(file_name) as file_in_zip:
-                            # Cria um objeto simples que simula o UploadedFile do Streamlit
-                            mock_file = SimpleNamespace(
-                                name=os.path.basename(file_name),
-                                getvalue=file_in_zip.read
-                            )
-                            process_and_display(mock_file)
-            except Exception as e:
-                st.error(f"Ocorreu um erro ao ler o arquivo ZIP: {e}")
+                        if erros == 0:
+                            st.success(f"✅ {sucesso} registros salvos com sucesso!")
+                        else:
+                            st.warning(f"⚠️ {sucesso} salvos, {erros} com erro.")
+                
+                with col2:
+                    if st.button("🔍 Buscar Informações Externas", use_container_width=True):
+                        if 'chave_acesso' not in df.columns:
+                            st.error("❌ Coluna 'chave_acesso' não encontrada!")
+                        else:
+                            with st.spinner("Buscando informações externas..."):
+                                sucesso, erros = processar_csv_com_busca_externa(
+                                    df, db_handler, api_externa_key
+                                )
+                            
+                            if erros == 0:
+                                st.success(f"✅ {sucesso} NF-e processadas com sucesso!")
+                            else:
+                                st.warning(f"⚠️ {sucesso} processadas, {erros} com erro.")
+        
+        # --- PROCESSAMENTO ZIP ---
+        elif is_zip:
+            st.subheader("📦 Processamento de ZIP")
+            st.info("Funcionalidade de processamento de ZIP a ser implementada")
+            
+            # TODO: Implementar extração e processamento de arquivos ZIP
+        
+        # --- PROCESSAMENTO XML ---
+        elif is_xml:
+            st.subheader("📋 Processamento de XML (NFe)")
+            
+            from utils.xml_processor import XMLNFeProcessor
+            
+            xml_processor = XMLNFeProcessor()
+            
+            if st.button("🔍 Processar XML", use_container_width=True):
+                with st.spinner("Processando XML da NFe..."):
+                    dados = xml_processor.processar_xml(uploaded_file)
+                    dados_json = xml_processor.to_json(dados)
+                    
+                    st.session_state.dados_xml = dados_json
+                    st.session_state.processado_xml = True
+                
+                st.success("✅ XML processado com sucesso!")
+                
+                # Exibir dados
+                with st.expander("📋 Ver Dados Extraídos", expanded=True):
+                    st.json(dados)
+                
+                # Salvar no banco
+                try:
+                    doc = Documento(
+                        nome_arquivo=uploaded_file.name,
+                        tipo_documento=dados.get('tipo_documento', 'NFe'),
+                        conteudo_extraido=dados_json
+                    )
+                    
+                    # Adicionar campos específicos
+                    campos_salvos = []
+                    for key, value in dados.items():
+                        if key not in ['tipo_documento', 'conteudo_extraido', 'nome_arquivo']:
+                            try:
+                                if isinstance(value, (dict, list)):
+                                    setattr(doc, key, json.dumps(value, ensure_ascii=False))
+                                else:
+                                    setattr(doc, key, str(value))
+                                campos_salvos.append(key)
+                            except:
+                                pass
+                    
+                    db_handler.save_document(doc)
+                    st.success(f"💾 NFe salva no banco! ({len(campos_salvos)} campos)")
+                    
+                except Exception as e:
+                    st.error(f"Erro ao salvar: {e}")
+            
+            # Chat sobre XML
+            if st.session_state.get('processado_xml'):
+                st.write("---")
+                st.subheader("💬 Faça Perguntas sobre a NFe")
+                
+                user_question = st.text_input(
+                    "Digite sua pergunta:",
+                    placeholder="Ex: Qual o valor total da nota?",
+                    key="xml_question"
+                )
+                
+                if user_question and openai_api_key:
+                    with st.spinner("Pensando..."):
+                        from langchain_openai import ChatOpenAI
+                        from langchain.schema import HumanMessage, SystemMessage
+                        
+                        llm = ChatOpenAI(temperature=0.3, model="gpt-4o", api_key=openai_api_key)
+                        
+                        messages = [
+                            SystemMessage(content=f"""
+                            Você é um assistente especializado em Notas Fiscais Eletrônicas.
+                            
+                            Dados da NFe:
+                            {st.session_state.dados_xml}
+                            
+                            Responda às perguntas de forma clara e objetiva.
+                            """),
+                            HumanMessage(content=user_question)
+                        ]
+                        
+                        response = llm.invoke(messages)
+                        resposta = response.content
+                    
+                    st.write("**🤖 Resposta:**")
+                    st.info(resposta)
+        
+        # --- PROCESSAMENTO DOCUMENTOS INDIVIDUAIS (PDF/IMAGEM) ---
         else:
-            # Processa o arquivo único
-            process_and_display(uploaded_file)
+            st.subheader("📄 Processamento de Documento com IA")
+            
+            if not openai_api_key:
+                st.warning("⚠️ Configure a chave da API OpenAI na barra lateral para processar documentos.")
+            else:
+                # Processar documento com Vision diretamente (sem agente complexo)
+                
+                # Botão para processar
+                if st.button("🔍 Processar Documento com IA", use_container_width=True):
+                    with st.spinner("Analisando documento..."):
+                        # Chamar diretamente a ferramenta Vision (mais simples e confiável)
+                        from utils.document_agent import DocumentVisionTool
+                        from langchain_openai import ChatOpenAI
+                        
+                        llm = ChatOpenAI(temperature=0, model="gpt-4o", max_tokens=2000, api_key=openai_api_key)
+                        vision_tool = DocumentVisionTool(llm)
+                        
+                        resultado = vision_tool.extrair_dados(uploaded_file)
+                        st.session_state.dados_doc = resultado
+                        st.session_state.ultimo_doc_dados = resultado  # Para chat posterior
+                        st.session_state.processado = True
+                    
+                    st.success("✅ Documento processado!")
+                    
+                    # Debug: mostrar resposta crua
+                    with st.expander("🔍 Debug - Resposta Completa do Agente"):
+                        st.write("**Tipo:**", type(st.session_state.dados_doc))
+                        st.code(st.session_state.dados_doc)
+                    
+                    # Exibir dados extraídos
+                    with st.expander("📋 Ver Dados Extraídos", expanded=True):
+                        # Tentar identificar se tem JSON dentro da resposta
+                        try:
+                            import re
+                            # Procurar por JSON na resposta
+                            json_match = re.search(r'\{.*\}', st.session_state.dados_doc, re.DOTALL)
+                            if json_match:
+                                json_str = json_match.group()
+                                st.code(json_str, language='json')
+                            else:
+                                st.code(st.session_state.dados_doc, language='json')
+                        except:
+                            st.code(st.session_state.dados_doc, language='json')
+                    
+                    # Salvar no banco
+                    try:
+                        import json
+                        import re
+                        
+                        # Tentar extrair JSON da resposta
+                        dados_str = st.session_state.dados_doc
+                        
+                        # Tentar parsear direto
+                        try:
+                            dados_dict = json.loads(dados_str)
+                        except json.JSONDecodeError:
+                            # Tentar encontrar JSON na string
+                            json_match = re.search(r'\{.*\}', dados_str, re.DOTALL)
+                            if json_match:
+                                dados_dict = json.loads(json_match.group())
+                            else:
+                                # Se não encontrar, salvar como texto
+                                raise ValueError("JSON não encontrado na resposta")
+                        
+                        doc = Documento(
+                            nome_arquivo=uploaded_file.name,
+                            tipo_documento=dados_dict.get('tipo_documento', 'Documento'),
+                            conteudo_extraido=json.dumps(dados_dict, ensure_ascii=False, indent=2)
+                        )
+                        
+                        # Adicionar campos extras se for dict válido
+                        campos_salvos = []
+                        for key, value in dados_dict.items():
+                            if key not in ['tipo_documento', 'conteudo_extraido', 'nome_arquivo']:
+                                try:
+                                    # Converter valores complexos para string
+                                    if isinstance(value, (dict, list)):
+                                        setattr(doc, key, json.dumps(value, ensure_ascii=False))
+                                    else:
+                                        setattr(doc, key, str(value))
+                                    campos_salvos.append(key)
+                                except:
+                                    pass
+                        
+                        db_handler.save_document(doc)
+                        st.success(f"💾 Dados salvos no banco! ({len(campos_salvos)} campos extras)")
+                        
+                        if campos_salvos:
+                            with st.expander("Ver campos salvos"):
+                                st.write(campos_salvos)
+                        
+                    except Exception as e:
+                        st.error(f"❌ Erro ao salvar no banco: {e}")
+                        st.write("**Dados que tentamos salvar:**")
+                        st.code(st.session_state.dados_doc)
+                        
+                        # Salvar pelo menos o texto bruto
+                        try:
+                            doc = Documento(
+                                nome_arquivo=uploaded_file.name,
+                                tipo_documento='Documento',
+                                conteudo_extraido=st.session_state.dados_doc
+                            )
+                            db_handler.save_document(doc)
+                            st.info("💾 Salvou pelo menos o texto bruto no banco.")
+                        except Exception as e2:
+                            st.error(f"Falha total ao salvar: {e2}")
+                
+                # Chat sobre o documento
+                if st.session_state.get('processado'):
+                    st.write("---")
+                    st.subheader("💬 Faça Perguntas sobre o Documento")
+                    
+                    user_question = st.text_input(
+                        "Digite sua pergunta:",
+                        placeholder="Ex: Qual o valor total da nota?"
+                    )
+                    
+                    if user_question:
+                        with st.spinner("Pensando..."):
+                            # Usar LLM diretamente com contexto
+                            from langchain_openai import ChatOpenAI
+                            from langchain.schema import HumanMessage, SystemMessage
+                            
+                            llm = ChatOpenAI(temperature=0.3, model="gpt-4o", api_key=openai_api_key)
+                            
+                            messages = [
+                                SystemMessage(content=f"""
+                                Você é um assistente especializado em análise de documentos fiscais.
+                                
+                                Aqui estão os dados do documento atual:
+                                {st.session_state.dados_doc}
+                                
+                                Responda às perguntas do usuário baseado nestes dados de forma clara e objetiva.
+                                """),
+                                HumanMessage(content=user_question)
+                            ]
+                            
+                            response = llm.invoke(messages)
+                            resposta = response.content
+                        
+                        st.write("**🤖 Resposta:**")
+                        st.info(resposta)
+
+with tab2:
+    st.subheader("💬 Converse com a IA sobre seus Documentos")
+    
+    if not openai_api_key:
+        st.warning("⚠️ Configure a chave da API OpenAI na barra lateral para usar o chat.")
+    else:
+        import os
+        os.environ["OPENAI_API_KEY"] = openai_api_key
+        
+        from langchain_openai import ChatOpenAI
+        from langchain.agents import AgentExecutor, create_react_agent
+        from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
+        from langchain.memory import ConversationBufferMemory
+        from utils.database_tool import DatabaseQueryTool
+        
+        # Inicializar agente (apenas uma vez)
+        if 'chat_agent_executor' not in st.session_state:
+            with st.spinner("🤖 Inicializando assistente com acesso ao banco..."):
+                # Criar ferramentas de banco de dados
+                db_tool = DatabaseQueryTool(db_path="data/documentos.db")
+                tools = db_tool.get_tools()
+                
+                # LLM
+                llm = ChatOpenAI(model="gpt-4o", temperature=0.3, api_key=openai_api_key)
+                
+                # Prompt do agente
+                prompt = ChatPromptTemplate.from_messages([
+                    ("system", """
+                    Você é um assistente especializado em análise de documentos fiscais brasileiros.
+                    
+                    Você tem acesso a um banco de dados com documentos salvos (Notas Fiscais, NFes, etc).
+                    
+                    Use as ferramentas disponíveis para:
+                    - Listar documentos
+                    - Buscar documentos específicos
+                    - Calcular totais
+                    - Analisar dados
+                    
+                    Ferramentas disponíveis:
+                    {tools}
+                    
+                    Nomes das ferramentas: {tool_names}
+                    
+                    FORMATO DE RESPOSTA:
+                    
+                    Question: [pergunta do usuário]
+                    Thought: [seu raciocínio]
+                    Action: [nome da ferramenta]
+                    Action Input: [entrada para ferramenta]
+                    Observation: [resultado]
+                    ... (repita se necessário)
+                    Thought: Agora sei a resposta
+                    Final Answer: [resposta clara para o usuário]
+                    
+                    IMPORTANTE:
+                    - Sempre use as ferramentas para buscar dados reais do banco
+                    - Seja preciso com valores monetários
+                    - Se não encontrar algo, diga claramente
+                    - Formate valores em reais: R$ X,XX
+                    """),
+                    MessagesPlaceholder(variable_name="chat_history"),
+                    ("human", "{input}"),
+                    ("assistant", "{agent_scratchpad}")
+                ])
+                
+                # Memória
+                memory = ConversationBufferMemory(
+                    memory_key="chat_history",
+                    return_messages=True
+                )
+                
+                # Criar agente
+                agent = create_react_agent(llm, tools, prompt)
+                
+                st.session_state.chat_agent_executor = AgentExecutor(
+                    agent=agent,
+                    tools=tools,
+                    memory=memory,
+                    verbose=True,
+                    handle_parsing_errors=True,
+                    max_iterations=5
+                )
+        
+        st.info("✅ Assistente pronto! Pergunte sobre os documentos salvos no banco.")
+        
+        # Sugestões de perguntas
+        with st.expander("💡 Exemplos de perguntas"):
+            st.markdown("""
+            - "Quais documentos eu tenho salvos?"
+            - "Mostre o documento 5"
+            - "Liste todas as NFes"
+            - "Qual o valor total de todas as notas?"
+            - "Encontre documentos da empresa XYZ"
+            - "Mostre as notas de janeiro de 2025"
+            """)
+        
+        # Histórico de chat
+        if 'chat_messages' not in st.session_state:
+            st.session_state.chat_messages = []
+        
+        # Exibir mensagens anteriores
+        for message in st.session_state.chat_messages:
+            with st.chat_message(message["role"]):
+                st.write(message["content"])
+        
+        # Input do usuário
+        if prompt := st.chat_input("Digite sua pergunta sobre os documentos..."):
+            # Adicionar mensagem do usuário
+            st.session_state.chat_messages.append({"role": "user", "content": prompt})
+            with st.chat_message("user"):
+                st.write(prompt)
+            
+            # Gerar resposta com agente
+            with st.chat_message("assistant"):
+                with st.spinner("🔍 Consultando banco de dados..."):
+                    try:
+                        response = st.session_state.chat_agent_executor.invoke({
+                            "input": prompt
+                        })
+                        resposta = response.get('output', 'Não consegui gerar uma resposta.')
+                    except KeyError as e:
+                        resposta = f"Erro de chave: {e}. Verifique se os dados do banco estão no formato correto."
+                        st.error("💡 Dica: Pode ser que a estrutura dos dados no banco esteja inconsistente.")
+                    except Exception as e:
+                        resposta = f"Erro ao processar: {e}"
+                        st.error("💡 Dica: Tente reformular sua pergunta de forma mais específica.")
+                        
+                        # Debug info
+                        with st.expander("🔍 Informações de debug"):
+                            st.write("**Erro completo:**")
+                            st.code(str(e))
+                            st.write("**Tipo de erro:**", type(e).__name__)
+                
+                st.write(resposta)
+            
+            # Adicionar resposta ao histórico
+            st.session_state.chat_messages.append({
+                "role": "assistant",
+                "content": resposta
+            })
+        
+        # Botão para limpar histórico
+        if st.button("🗑️ Limpar Conversa"):
+            st.session_state.chat_messages = []
+            st.session_state.chat_agent_executor.memory.clear()
+            st.rerun()
