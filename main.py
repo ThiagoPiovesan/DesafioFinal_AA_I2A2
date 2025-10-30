@@ -319,10 +319,232 @@ with tab1:
         
         # --- PROCESSAMENTO ZIP ---
         elif is_zip:
-            st.subheader("📦 Processamento de ZIP")
-            st.info("Funcionalidade de processamento de ZIP a ser implementada")
+            st.subheader("📦 Processamento de Arquivo ZIP")
             
-            # TODO: Implementar extração e processamento de arquivos ZIP
+            st.info("O sistema irá extrair e processar automaticamente todos os arquivos suportados dentro do ZIP.")
+            
+            # Opções de processamento
+            with st.expander("⚙️ Opções de Processamento"):
+                col1, col2 = st.columns(2)
+                with col1:
+                    processar_xml = st.checkbox("Processar XML", value=True)
+                    processar_pdf = st.checkbox("Processar PDF (Vision)", value=True, 
+                                               disabled=not openai_api_key,
+                                               help="Requer chave OpenAI")
+                with col2:
+                    processar_imagens = st.checkbox("Processar Imagens (Vision)", value=True,
+                                                   disabled=not openai_api_key,
+                                                   help="Requer chave OpenAI")
+                    salvar_automatico = st.checkbox("Salvar automaticamente no banco", value=True)
+                
+                if not openai_api_key:
+                    st.warning("⚠️ Configure a chave OpenAI para processar PDF e Imagens")
+            
+            # Mostrar prévia do conteúdo
+            try:
+                zip_buffer = io.BytesIO(uploaded_file.getvalue())
+                with zipfile.ZipFile(zip_buffer, 'r') as zip_ref:
+                    file_list = [f for f in zip_ref.namelist() 
+                                if not f.endswith('/') and not f.startswith('__MACOSX')]
+                    
+                    st.write(f"**Arquivos encontrados:** {len(file_list)}")
+                    
+                    # Contar por tipo
+                    tipos_encontrados = {}
+                    for fname in file_list:
+                        ext = fname.split('.')[-1].lower()
+                        tipos_encontrados[ext] = tipos_encontrados.get(ext, 0) + 1
+                    
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric("📋 XML", tipos_encontrados.get('xml', 0))
+                    with col2:
+                        st.metric("📄 PDF", tipos_encontrados.get('pdf', 0))
+                    with col3:
+                        st.metric("🖼️ Imagens", 
+                                 tipos_encontrados.get('png', 0) + 
+                                 tipos_encontrados.get('jpg', 0) + 
+                                 tipos_encontrados.get('jpeg', 0))
+                    with col4:
+                        st.metric("📊 Outros", sum(tipos_encontrados.values()) - 
+                                 tipos_encontrados.get('xml', 0) - 
+                                 tipos_encontrados.get('pdf', 0) - 
+                                 tipos_encontrados.get('png', 0) - 
+                                 tipos_encontrados.get('jpg', 0) - 
+                                 tipos_encontrados.get('jpeg', 0))
+                    
+                    with st.expander("📋 Ver lista de arquivos"):
+                        for fname in file_list:
+                            st.write(f"- {fname}")
+                            
+            except Exception as e:
+                st.error(f"Erro ao ler ZIP: {e}")
+            
+            # Botão para processar
+            if st.button("🚀 Processar Todos os Arquivos do ZIP", use_container_width=True):
+                
+                # Contadores
+                processados = 0
+                com_sucesso = 0
+                com_erro = 0
+                nao_suportados = 0
+                
+                resultados_detalhados = []
+                
+                # Progress bar
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                try:
+                    zip_buffer = io.BytesIO(uploaded_file.getvalue())
+                    with zipfile.ZipFile(zip_buffer, 'r') as zip_ref:
+                        file_list = [f for f in zip_ref.namelist() 
+                                    if not f.endswith('/') and not f.startswith('__MACOSX')]
+                        
+                        total_files = len(file_list)
+                        
+                        for idx, file_name in enumerate(file_list):
+                            processados += 1
+                            status_text.text(f"Processando {processados}/{total_files}: {file_name}")
+                            progress_bar.progress(processados / total_files)
+                            
+                            # Extrair arquivo
+                            with zip_ref.open(file_name) as file_in_zip:
+                                file_bytes = file_in_zip.read()
+                                
+                                # Criar objeto mock do arquivo
+                                class MockUploadedFile:
+                                    def __init__(self, name, content):
+                                        self.name = name
+                                        self._content = content
+                                    
+                                    def getvalue(self):
+                                        return self._content
+                                    
+                                    def read(self):
+                                        return self._content
+                                
+                                mock_file = MockUploadedFile(
+                                    name=os.path.basename(file_name),
+                                    content=file_bytes
+                                )
+                                
+                                # Processar baseado no tipo
+                                ext = file_name.split('.')[-1].lower()
+                                resultado = {
+                                    "arquivo": file_name,
+                                    "tipo": ext,
+                                    "status": "Desconhecido",
+                                    "mensagem": ""
+                                }
+                                
+                                try:
+                                    # XML
+                                    if ext == 'xml':
+                                        from utils.xml_processor import XMLNFeProcessor
+                                        xml_processor = XMLNFeProcessor()
+                                        dados = xml_processor.processar_xml(mock_file)
+                                        
+                                        if "erro" not in dados:
+                                            # Salvar no banco
+                                            doc = Documento(
+                                                nome_arquivo=mock_file.name,
+                                                tipo_documento=dados.get('tipo_documento', 'NFe'),
+                                                conteudo_extraido=json.dumps(dados, ensure_ascii=False)
+                                            )
+                                            db_handler.save_document(doc)
+                                            
+                                            com_sucesso += 1
+                                            resultado["status"] = "✅ Sucesso"
+                                            resultado["mensagem"] = f"NFe processada - Valor: R$ {dados.get('valores', {}).get('valor_total', 'N/A')}"
+                                        else:
+                                            com_erro += 1
+                                            resultado["status"] = "❌ Erro"
+                                            resultado["mensagem"] = dados.get("erro", "Erro desconhecido")
+                                    
+                                    # PDF ou Imagem (Vision)
+                                    elif ext in ['pdf', 'png', 'jpg', 'jpeg'] and openai_api_key:
+                                        from utils.document_agent import DocumentVisionTool
+                                        from langchain_openai import ChatOpenAI
+                                        
+                                        llm = ChatOpenAI(temperature=0, model="gpt-4o", max_tokens=2000, api_key=openai_api_key)
+                                        vision_tool = DocumentVisionTool(llm)
+                                        
+                                        dados_json = vision_tool.extrair_dados(mock_file)
+                                        
+                                        # Salvar no banco
+                                        doc = Documento(
+                                            nome_arquivo=mock_file.name,
+                                            tipo_documento="Documento",
+                                            conteudo_extraido=dados_json
+                                        )
+                                        db_handler.save_document(doc)
+                                        
+                                        com_sucesso += 1
+                                        resultado["status"] = "✅ Sucesso"
+                                        resultado["mensagem"] = "Processado com Vision"
+                                    
+                                    elif ext in ['pdf', 'png', 'jpg', 'jpeg'] and not openai_api_key:
+                                        nao_suportados += 1
+                                        resultado["status"] = "⚠️ Pulado"
+                                        resultado["mensagem"] = "Requer chave OpenAI para processar"
+                                    
+                                    else:
+                                        nao_suportados += 1
+                                        resultado["status"] = "⚠️ Não suportado"
+                                        resultado["mensagem"] = f"Tipo de arquivo não suportado: {ext}"
+                                
+                                except Exception as e:
+                                    com_erro += 1
+                                    resultado["status"] = "❌ Erro"
+                                    resultado["mensagem"] = str(e)
+                                
+                                resultados_detalhados.append(resultado)
+                
+                except Exception as e:
+                    st.error(f"Erro ao processar ZIP: {e}")
+                
+                # Limpar progress
+                progress_bar.empty()
+                status_text.empty()
+                
+                # Mostrar resultados
+                st.write("---")
+                st.subheader("📊 Resumo do Processamento")
+                
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("📝 Total Processados", processados)
+                with col2:
+                    st.metric("✅ Sucesso", com_sucesso, delta=None, delta_color="normal")
+                with col3:
+                    st.metric("❌ Erros", com_erro, delta=None, delta_color="inverse")
+                with col4:
+                    st.metric("⚠️ Não Suportados", nao_suportados)
+                
+                # Tabela de resultados
+                if resultados_detalhados:
+                    st.write("**Detalhes por arquivo:**")
+                    df_resultados = pd.DataFrame(resultados_detalhados)
+                    st.dataframe(df_resultados, use_container_width=True)
+                    
+                    # Opção de download do relatório
+                    csv = df_resultados.to_csv(index=False).encode('utf-8')
+                    st.download_button(
+                        label="📥 Baixar Relatório CSV",
+                        data=csv,
+                        file_name=f"relatorio_processamento_{uploaded_file.name}.csv",
+                        mime="text/csv"
+                    )
+                
+                if com_sucesso > 0:
+                    st.success(f"🎉 {com_sucesso} documento(s) processado(s) e salvo(s) no banco com sucesso!")
+                
+                if com_erro > 0:
+                    st.warning(f"⚠️ {com_erro} arquivo(s) com erro durante o processamento.")
+                
+                if nao_suportados > 0:
+                    st.info(f"ℹ️ {nao_suportados} arquivo(s) não suportado(s) ou pulado(s).")
         
         # --- PROCESSAMENTO XML ---
         elif is_xml:
